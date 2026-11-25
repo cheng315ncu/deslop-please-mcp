@@ -7,16 +7,18 @@ mod format;
 mod graph;
 mod indexing;
 mod lint;
+mod mcp;
 mod model;
 mod scip;
 mod workspace;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use allow::AllowList;
 use configuration::Configuration;
+use lint::Diagnostic;
 use model::Model;
 use workspace::Workspace;
 
@@ -58,6 +60,7 @@ fn usage() -> String {
 usage: {TOOL} [crate_or_mod] [--allow <path>] [--update-allow <path>]
        [--target <triple>] [-F, --features <features>] [--all-features]
        [--no-default-features] [--json | --sarif]
+       {TOOL} --mcp [<directory>]
 
 Runs architectural lints (module-cycle, tangle, field-leak, shallow-module,
 wide-directory, long-file) on the Cargo workspace.
@@ -85,6 +88,11 @@ choose another. Code behind a `cfg` that it leaves off, such as a
 configuration that matters.
 
 A flag's value is the next word, or follows `=`: `--target=<triple>`.
+
+--mcp serves the lints to agents as an MCP server on stdin and stdout, with
+one tool, `check`, of the workspace around <directory> (default: the current
+directory) unless the call names another. It reads the allow file
+`.{TOOL}.allow` at the workspace's root, if there is one.
 "
     )
 }
@@ -217,6 +225,11 @@ fn main() -> ExitCode {
         println!("{TOOL} {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    if let [flag, rest @ ..] = arguments.as_slice()
+        && flag == "--mcp"
+    {
+        return serve(rest);
+    }
     let options = match parse_arguments(&arguments) {
         Ok(options) => options,
         Err(message) => {
@@ -235,17 +248,31 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--mcp [<directory>]`.
+fn serve(arguments: &[String]) -> ExitCode {
+    let directory = match arguments {
+        [] => PathBuf::from("."),
+        [directory] if !directory.starts_with('-') => PathBuf::from(directory),
+        _ => {
+            eprintln!("{TOOL}: '--mcp' takes one directory and nothing else");
+            eprint!("{}", usage());
+            return ExitCode::from(2);
+        }
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    match mcp::serve(&directory, stdin.lock(), stdout.lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{TOOL}: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn run(options: Options) -> Result<bool, Error> {
     let workspace = Workspace::discover()?;
-    let model = load_model(&workspace, &options.configuration)?;
-    let scope = match &options.scope {
-        Some(query) => Some(
-            lint::resolve_node(&model, query)
-                .ok_or_else(|| Error::new(format!("{query}: no such crate or module")))?,
-        ),
-        None => None,
-    };
-    let all = lint::check(&model, scope);
+    let all = diagnose(&workspace, options.scope.as_deref(), &options.configuration)?;
 
     if let Some(path) = options.update_allow {
         let allow = AllowList::from_diagnostics(&all);
@@ -254,20 +281,23 @@ fn run(options: Options) -> Result<bool, Error> {
         return Ok(true);
     }
 
-    let (reported, fixed_allowed, allow_shown) = match &options.allow {
-        Some(path) => {
-            let allow = AllowList::read(path)?;
-            let fixed = allow.fixed_count(&all);
-            let active: Vec<_> = all.into_iter().filter(|d| !allow.is_allowed(d)).collect();
-            (active, fixed, Some(path.display().to_string()))
-        }
-        None => (all, 0, None),
+    let (reported, fixed_allowed) = match &options.allow {
+        Some(path) => unallowed(all, path)?,
+        None => (all, 0),
     };
-
+    let allow_shown = options
+        .allow
+        .as_ref()
+        .map(|path| path.display().to_string());
     match options.format {
         OutputFormat::Text => print!(
             "{}",
-            format::render(&reported, fixed_allowed, allow_shown.as_deref())
+            format::render(
+                &reported,
+                fixed_allowed,
+                allow_shown.as_deref(),
+                format::stdout_has_color()
+            )
         ),
         OutputFormat::Json => print!(
             "{}",
@@ -276,6 +306,33 @@ fn run(options: Options) -> Result<bool, Error> {
         OutputFormat::Sarif => print!("{}", format::render_sarif(&reported)),
     }
     Ok(reported.is_empty())
+}
+
+/// Every diagnostic of `workspace` in `configuration`, or only where `scope`,
+/// a crate or module, is concerned.
+fn diagnose(
+    workspace: &Workspace,
+    scope: Option<&str>,
+    configuration: &Configuration,
+) -> Result<Vec<Diagnostic>, Error> {
+    let model = load_model(workspace, configuration)?;
+    let scope = match scope {
+        Some(query) => Some(
+            lint::resolve_node(&model, query)
+                .ok_or_else(|| Error::new(format!("{query}: no such crate or module")))?,
+        ),
+        None => None,
+    };
+    Ok(lint::check(&model, scope))
+}
+
+/// What of `all` the allow file at `path` does not list, and how many of its
+/// entries are fixed.
+fn unallowed(all: Vec<Diagnostic>, path: &Path) -> Result<(Vec<Diagnostic>, usize), Error> {
+    let allow = AllowList::read(path)?;
+    let fixed = allow.fixed_count(&all);
+    let active = all.into_iter().filter(|d| !allow.is_allowed(d)).collect();
+    Ok((active, fixed))
 }
 
 fn load_model(workspace: &Workspace, configuration: &Configuration) -> Result<Model, Error> {

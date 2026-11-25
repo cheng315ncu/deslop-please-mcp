@@ -3,8 +3,11 @@
 //! variants in `tests/variants/<family>/<variant>`, each holding only the files
 //! it changes: restructurings that must report the same keys, and a fix.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+
+use serde_json::{Value, json};
 
 const TOOL: &str = "deslop-please";
 const PROGRAM: &str = env!("CARGO_BIN_EXE_deslop-please");
@@ -754,4 +757,145 @@ fn outside_a_cargo_workspace_reports_error() {
     std::fs::remove_dir_all(&empty).unwrap();
     assert_eq!(run.code, Some(2));
     assert!(run.stderr.contains("not inside a Cargo workspace"));
+}
+
+/// The result of a `check` call to `deslop-please --mcp <directory>`, after the
+/// handshake, with `arguments`. The server runs outside `directory`, as an
+/// agent's client may start it.
+fn mcp_check(directory: &Path, arguments: Value) -> Value {
+    let messages = [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "capabilities": {},
+                            "clientInfo": { "name": "test", "version": "0" } } }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "check", "arguments": arguments } }),
+    ];
+    let mut server = Command::new(PROGRAM)
+        .arg("--mcp")
+        .arg(directory)
+        .current_dir(env!("CARGO_TARGET_TMPDIR"))
+        .env("CARGO_TERM_COLOR", "always")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = server.stdin.take().unwrap();
+    for message in messages {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+    let output = server.wait_with_output().unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(0));
+    let replies: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], TOOL);
+    assert_eq!(replies[1]["id"], 2);
+    replies[1]["result"].clone()
+}
+
+/// The `lint key` of each error in a `check` result.
+fn mcp_keys(result: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = result["structuredContent"]["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|error| {
+            format!(
+                "{} {}",
+                error["lint"].as_str().unwrap(),
+                error["key"].as_str().unwrap()
+            )
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn the_mcp_check_reports_what_the_command_line_does_in_plain_text_and_structured() {
+    let leaky = workspace("field_leak", None, "mcp");
+    let result = mcp_check(&leaky, json!({}));
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["structuredContent"]["ok"], false);
+    assert_eq!(mcp_keys(&result), keys(&leaky));
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("error[field-leak]: `RunQueue::items`"),
+        "{text}"
+    );
+    assert!(!text.contains('\x1b'), "no color: {text}");
+    let leak = &result["structuredContent"]["errors"][0];
+    assert_eq!(leak["file"], "src/sched/policy.rs");
+    assert!(leak["line"].is_u64());
+
+    let clean = workspace("clean", None, "mcp-clean");
+    let result = mcp_check(&clean, json!({}));
+    assert_eq!(result["structuredContent"]["ok"], true);
+    assert_eq!(result["structuredContent"]["errors"], json!([]));
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{TOOL}: ok"))
+    );
+}
+
+#[test]
+fn the_mcp_check_reads_the_allow_file_at_the_workspace_root_from_any_directory_in_it() {
+    let workspace = workspace("field_leak", None, "mcp-allow");
+    let allow = workspace.join(format!(".{TOOL}.allow"));
+    assert_eq!(
+        run(&workspace, &["--update-allow", allow.to_str().unwrap()]).code,
+        Some(0)
+    );
+    let result = mcp_check(&workspace, json!({ "directory": "src/sched" }));
+    assert_eq!(result["structuredContent"]["ok"], true);
+    assert_eq!(
+        result["structuredContent"]["allow_file"],
+        allow.to_str().unwrap()
+    );
+
+    let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/variants/field_leak/real");
+    copy_directory(&real, &workspace);
+    let fixed = mcp_check(&workspace, json!({}));
+    assert_eq!(fixed["structuredContent"]["fixed_allowed"], 2);
+    assert!(
+        fixed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("now fixed")
+    );
+}
+
+#[test]
+fn an_mcp_check_that_cannot_run_is_a_tool_error_with_the_reason() {
+    let empty =
+        std::env::temp_dir().join(format!("{TOOL}-mcp-not-a-workspace-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
+    let result = mcp_check(&empty, json!({}));
+    std::fs::remove_dir_all(&empty).unwrap();
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("not inside a Cargo workspace"), "{text}");
+    assert!(
+        text.contains("call `check` again with `directory`"),
+        "{text}"
+    );
+
+    let workspace = workspace("clean", None, "mcp-no-such-scope");
+    let result = mcp_check(&workspace, json!({ "scope": "no_such_crate" }));
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no such crate or module")
+    );
 }

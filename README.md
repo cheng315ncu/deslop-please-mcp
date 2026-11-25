@@ -39,6 +39,14 @@ deslop-please --update-allow .deslop-please.allow
 deslop-please --allow .deslop-please.allow 
 ```
 
+### Let your agent run it
+
+`deslop-please --mcp [<directory>]` serves the lints over MCP on stdin and stdout, with one tool, `check`. It checks the workspace around `<directory>`, or the current directory, unless the call names another directory. It reports what the command line reports, as text and as structured content. It reads `.deslop-please.allow` at the workspace's root if there is one, and never writes it.
+
+```json
+{ "mcpServers": { "deslop-please": { "command": "deslop-please", "args": ["--mcp", "/path/to/workspace"] } } }
+```
+
 ### Add to your `AGENTS.md`
 
 ```markdown

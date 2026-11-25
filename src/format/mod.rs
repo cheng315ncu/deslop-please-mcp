@@ -1,5 +1,6 @@
 //! `rustc`/`clippy`-style diagnostic formatting, in color when stdout is a
-//! terminal, with a picture under each report.
+//! terminal, with a picture under each report; and the same diagnostics as
+//! JSON, for tools.
 
 mod picture;
 mod sarif;
@@ -16,8 +17,9 @@ pub fn render(
     diagnostics: &[Diagnostic],
     fixed_allowed: usize,
     allow_path: Option<&str>,
+    color: bool,
 ) -> String {
-    let paint = Paint(stdout_has_color());
+    let paint = Paint(color);
     let mut out = String::new();
     for diag in diagnostics {
         let _ = writeln!(
@@ -73,9 +75,15 @@ pub fn render(
     out
 }
 
+/// Each diagnostic as an object: its lint, its key as the allow file lists
+/// it, its message, where it is (`file` and `line`, or nulls), and its notes.
+pub fn json(diagnostics: &[Diagnostic]) -> Value {
+    diagnostics.iter().map(diagnostic_json).collect()
+}
+
 /// Like cargo: `CARGO_TERM_COLOR=always|never` decides, then `NO_COLOR`, then
 /// whether stdout is a terminal.
-fn stdout_has_color() -> bool {
+pub fn stdout_has_color() -> bool {
     match std::env::var("CARGO_TERM_COLOR").as_deref() {
         Ok("always") => true,
         Ok("never") => false,
